@@ -1,0 +1,3 @@
+[submodule "hdiscount"]
+	path = hdiscount
+	url = git@github.com:edahlgren/hdiscount

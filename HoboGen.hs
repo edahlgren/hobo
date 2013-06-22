@@ -37,11 +37,10 @@ type Template = (MuContext IO -> IO LB.ByteString)
 
 data Config = Config {
       base :: String
-    , port :: Int
     }
 
-getConfig (base:port:[]) = Config base (read port)
-getConfig _ = error "wrong number of arguments to hobo; use `hobo BASE_DIR PORT`"
+getConfig (base:[]) = Config base
+getConfig _ = error "wrong number of arguments to hobo; use `hobo BASE_DIR`"
 
 templateDir = "templates"
 
@@ -59,6 +58,21 @@ readTemplatesOrError base = do
     includeDir = base </> templateDir
 
 data Post = Post (HM.HashMap B.ByteString B.ByteString) B.ByteString
+
+parseHeaders :: Atto.Parser (HM.HashMap B.ByteString B.ByteString)
+parseHeaders = do
+    kvs <- Atto.many1 parseHeader
+    Atto.skipSpace
+    return $ HM.fromList kvs
+  where
+    parseHeader = do
+        nm <- Atto.takeWhile (\c -> c `elem` ['a'..'z'] || c `elem` ['A'..'Z'])
+        _ <- Atto.char ':'
+        Atto.skipSpace
+        val <- Atto.takeWhile (\c -> not $ c `elem` "\r\n")
+        Atto.takeWhile (\c -> c `elem` "\r\n")
+        return (B.map toLower nm, val)
+
 parsePost :: B.ByteString -> Post
 parsePost s =
     case Atto.parse parseHeaders s of
@@ -93,34 +107,9 @@ makePostPath cfg year month day name file =
     let dn = mconcat [year, "-", month, "-", day, "-", name] in
     (base cfg) </> "posts" </> dn </> file
 
-postPage ts cfg = do
-    url <- fmap rawPathInfo request
-    when (not $ B.last url == '/') $
-        redirect (TLE.decodeUtf8 $ LB.fromChunks [B.concat ["/", url, "/"]])
-    year <- param "year"
-    month <- param "month"
-    day <- param "day"
-    name <- param "name"
-    let fullpath = makePostPath cfg year month day name "post.md"
-    exists <- liftIO $ doesFileExist fullpath
-    let dt = makeDate year month day
-    case exists of
-        True -> do
-            c <- liftIO $ B.readFile fullpath
-            let Post headers body = parsePost c
-            let mod = markdownText body
-            out <- liftIO $ (postTemplate ts) (sub headers mod dt)
-            html $ TLE.decodeUtf8 out
-        False -> next
-  where
-    sub _ _ d "date" = MuVariable (createDateDisplay d)
-    sub _ b _ "body" = MuVariable b
-    sub h _ _ k =
-        case HM.lookup k h of
-            Just v -> MuVariable v
-            Nothing -> MuNothing
-
 data PostFile = PostFile String Day String
+
+parsePostName = parseParts . B.pack. (flip (++) "\n")
 
 parseParts f =
     case Atto.parse parseFilename f of
@@ -138,15 +127,43 @@ parseFilename = do
     Atto.char '-'
     name <- fmap B.unpack $ Atto.takeWhile (not . Atto.isEndOfLine . fromIntegral . ord)
     let date = makeDate year month day
-    let url = concat ["/", year, "/", month, "/", day, "/", name, "/"]
+    let url = concat ["./", year, "-", month, "-", day, "-", name, ".html"]
     return $ PostFile url date name
 
-home ts cfg = do
-    rpaths <- liftIO $ getDirectoryContents (base cfg </> "posts")
+compilePages ts cfg = do
+    rpaths <- getDirectoryContents (base cfg </> "posts")
+    let valid = catMaybes $ map validatePath rpaths
+    pages <- mapM (compilePage ts cfg) valid
+    return $ catMaybes pages
+  where
+    validatePath p = case parsePostName p of
+        Just _ -> Just p
+        Nothing -> Nothing
+
+compilePage ts cfg path = do
+    let fullpath = (base cfg </> "posts" </> path </> "post.md")
+    c <- B.readFile fullpath
+    let Post headers body = parsePost c
+    let mod = markdownText body
+    case parsePostName path of
+        Just (PostFile _ dt _) -> do
+            out <- (postTemplate ts) (sub headers mod dt)
+            return $ Just (path,out)
+        Nothing -> return Nothing
+  where
+    sub _ _ d "date" = MuVariable (createDateDisplay d)
+    sub _ b _ "body" = MuVariable b
+    sub h _ _ k =
+        case HM.lookup k h of
+            Just v -> MuVariable v
+            Nothing -> MuNothing
+
+compileHome ts cfg = do
+    rpaths <- getDirectoryContents (base cfg </> "posts")
     let paths = (reverse . sort) rpaths
-    let allPosts = catMaybes $ map (parseParts . B.pack . (flip (++) "\n")) paths
-    out <- liftIO $ (homeTemplate ts) (sub allPosts)
-    html $ TLE.decodeUtf8 out
+    let allPosts = catMaybes $ map parsePostName paths
+    out <- (homeTemplate ts) (sub allPosts)
+    return out
   where
     sub posts "posts" = MuList $ map postCompleter posts
     sub posts o = MuNothing
@@ -154,29 +171,17 @@ home ts cfg = do
     postCompleter (PostFile u d n) "date" = MuVariable (createDateDisplay d)
     postCompleter (PostFile u d n) "name" = MuVariable n
 
+writePage cfg text name = LB.writeFile (base cfg </> name ++ ".html") text
+
+writeHome cfg text = writePage cfg text "index"
+
+writePosts cfg pages = mapM_ (\(name,text) -> writePage cfg text name) pages
+
 main = do
     args <- getArgs
     let cfg = getConfig args
     ts <- readTemplatesOrError (base cfg)
-    scotty (port cfg) $ do
-        middleware logStdoutDev
-        middleware $ rewrite $ rewritePostStatic cfg
-        middleware $ staticPolicy
-            (noDots >-> (hasPrefix "static/" <|> (hasPrefix "posts/" >-> contains ".")) 
-            >-> addBase (base cfg))
-        get "/:year/:month/:day/:name" (postPage ts cfg)
-        get "/" (home ts cfg)
-
-parseHeaders :: Atto.Parser (HM.HashMap B.ByteString B.ByteString)
-parseHeaders = do
-    kvs <- Atto.many1 parseHeader
-    Atto.skipSpace
-    return $ HM.fromList kvs
-  where
-    parseHeader = do
-        nm <- Atto.takeWhile (\c -> c `elem` ['a'..'z'] || c `elem` ['A'..'Z'])
-        _ <- Atto.char ':'
-        Atto.skipSpace
-        val <- Atto.takeWhile (\c -> not $ c `elem` "\r\n")
-        Atto.takeWhile (\c -> c `elem` "\r\n")
-        return (B.map toLower nm, val)
+    home <- compileHome ts cfg
+    writeHome cfg home
+    posts <- compilePages ts cfg
+    writePosts cfg posts
