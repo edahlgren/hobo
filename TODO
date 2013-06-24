@@ -1,0 +1,18 @@
+ALL of the things, in order of hardest to least hardest
+
+X get a subdomain pointing to the blog, and main domain pointing to homepage
+X get a subdomain pointing to the prose site
+X refactor HoboGen.hs to optionally display a whole post on the homepage or a preview
+X refactor HoboGen.hs to partition home into n many posts, with a series of "older" pages
+X make archives work by month & title (no categories yet)
+X write a simple homepage with my picture and links to things
+X write css for the archives page
+X write css for the about page
+* write an arrow post for the blog site, showing how loop works and how arrows work minimally
+* write an about page
+X add Oldot to the prose site
+
+(annoying, but necessary)
+* make a private page of:
+** write a list of topics I'd like the blog to cover, with the theme "making haskell useful"
+** write a list of things I didn't know about haskell before using it in industry for a year

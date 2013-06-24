@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, DeriveDataTypeable #-}
 import           Data.Aeson (object)
 import           Control.Monad (when)
 import           Control.Monad.Trans (liftIO)
@@ -20,36 +20,47 @@ import           System.Directory (doesFileExist, getDirectoryContents)
 import           System.Environment (getArgs)
 import           Text.Hastache
 import qualified Data.Text as T
+import qualified Data.Text as LT
 import           Data.Char (toLower, ord)
-import           Data.Time.Format (formatTime)
+import           Data.Time.Format (formatTime, parseTime)
 import           Data.Time.Calendar (fromGregorian, Day)
 import           System.Locale (defaultTimeLocale)
 import           Data.Maybe (catMaybes)
+import qualified Data.List as L
+import           Safe (fromJustNote)
+import           System.Console.CmdArgs
+import           Data.Word (Word8)
 
-markdownText a = TLE.decodeUtf8 $ LB.fromChunks [markdown a]
+markdownBS a = LB.fromChunks [markdown a]
+
+markdownText = TLE.decodeUtf8
 
 data TemplateSet = TemplateSet {
       postTemplate :: Template
     , homeTemplate :: Template
+    , archiveTemplate :: Template
+    , aboutTemplate :: Template
     }
 
 type Template = (MuContext IO -> IO LB.ByteString)
 
 data Config = Config {
       base :: String
-    }
-
-getConfig (base:[]) = Config base
-getConfig _ = error "wrong number of arguments to hobo; use `hobo BASE_DIR`"
+    , preview :: Int
+    } deriving (Show, Data, Typeable)
 
 templateDir = "templates"
 
 readTemplatesOrError base = do
     post <- B.readFile (base </> templateDir </> "post.html")
     home <- B.readFile (base </> templateDir </> "home.html")
+    archive <- B.readFile (base </> templateDir </> "archive.html")
+    about <- B.readFile (base </> templateDir </> "about.html")
     return $ TemplateSet
         (hastacheStr ourConfig post)
         (hastacheStr ourConfig home)
+        (hastacheStr ourConfig archive)
+        (hastacheStr ourConfig about)
   where
     ourConfig = defaultConfig {
                       muTemplateFileDir=Just includeDir
@@ -90,6 +101,8 @@ makeDate year month day = do
 createDateDisplay day =
     formatTime defaultTimeLocale "%A, %B %e '%y" day
 
+createTitleFromName = T.unpack . T.replace "-" " " . T.pack
+
 rewritePostStatic :: Config -> [T.Text] -> a -> IO [T.Text]
 rewritePostStatic cfg parts@("static":x) _ = return parts
 rewritePostStatic cfg parts@(y:m:d:dn:"":[]) _ = return parts
@@ -109,16 +122,25 @@ makePostPath cfg year month day name file =
 
 data PostFile = PostFile String Day String
 
-parsePostName = parseParts . B.pack. (flip (++) "\n")
+parsePostName = parsePostParts . B.pack . (flip (++) "\n")
 
-parseParts f =
+parseArchive = parseArchiveParts . B.pack . (flip (++) "\n")
+
+parseArchiveParts f =
+    case Atto.parse parseParts' f of
+        Atto.Fail _ _ e -> Nothing
+        Atto.Partial _ -> Nothing
+        Atto.Done left (year, month, day, name@(n:_), url) ->
+            if (n == '_') then Nothing else Just (year,month,name,url)
+
+parsePostParts f =
     case Atto.parse parseFilename f of
         Atto.Fail _ _ e -> Nothing
         Atto.Partial _ -> Nothing
         Atto.Done left p@(PostFile _ _ (n:_)) ->
             if (n == '_') then Nothing else Just p
 
-parseFilename = do
+parseTitleParts = do
     year <- fmap B.unpack $ Atto.takeWhile (/= '-')
     Atto.char '-'
     month <- fmap B.unpack $ Atto.takeWhile (/= '-')
@@ -126,8 +148,16 @@ parseFilename = do
     day <- fmap B.unpack $ Atto.takeWhile (/= '-')
     Atto.char '-'
     name <- fmap B.unpack $ Atto.takeWhile (not . Atto.isEndOfLine . fromIntegral . ord)
+    return (year, month, day, name)
+
+parseParts' = do
+    (year, month, day, name) <- parseTitleParts
     let date = makeDate year month day
     let url = concat ["./", year, "-", month, "-", day, "-", name, ".html"]
+    return (year,month,date,name,url)
+
+parseFilename = do
+    (_,_,date,name,url) <- parseParts'
     return $ PostFile url date name
 
 compilePages ts cfg = do
@@ -140,11 +170,14 @@ compilePages ts cfg = do
         Just _ -> Just p
         Nothing -> Nothing
 
-compilePage ts cfg path = do
+getPost cfg path = do
     let fullpath = (base cfg </> "posts" </> path </> "post.md")
     c <- B.readFile fullpath
-    let Post headers body = parsePost c
-    let mod = markdownText body
+    return $ parsePost c
+
+compilePage ts cfg path = do
+    (Post headers body) <- getPost cfg path
+    let mod = markdownText . markdownBS $ body
     case parsePostName path of
         Just (PostFile _ dt _) -> do
             out <- (postTemplate ts) (sub headers mod dt)
@@ -158,18 +191,58 @@ compilePage ts cfg path = do
             Just v -> MuVariable v
             Nothing -> MuNothing
 
-compileHome ts cfg = do
+compileHome ts cfg limit = do
     rpaths <- getDirectoryContents (base cfg </> "posts")
     let paths = (reverse . sort) rpaths
-    let allPosts = catMaybes $ map parsePostName paths
-    out <- (homeTemplate ts) (sub allPosts)
+    let (allPosts, validPaths) = unzip . catMaybes $ map postWithPath paths
+    texts <- mapM (bodyFromPost cfg limit) validPaths
+    let postsWithText = zip allPosts texts
+    out <- (homeTemplate ts) (sub postsWithText)
     return out
   where
+    postWithPath path = case parsePostName path of
+        Just post -> Just (post,path)
+        Nothing -> Nothing
+
+    previewText body (Just limit) = markdownText $ LB.intercalate "\n" previewLines
+      where
+        previewLines = take limit $ LB.split '\n' $ markdownBS body
+    previewText body Nothing = markdownText . markdownBS $ body
+
+    bodyFromPost cfg limit path =
+      getPost cfg path >>= (\(Post _ body) -> return $ previewText body limit)
+
     sub posts "posts" = MuList $ map postCompleter posts
     sub posts o = MuNothing
-    postCompleter (PostFile u d n) "url" = MuVariable u
-    postCompleter (PostFile u d n) "date" = MuVariable (createDateDisplay d)
-    postCompleter (PostFile u d n) "name" = MuVariable n
+
+    postCompleter ((PostFile u d n),_) "title" = MuVariable (createTitleFromName n)
+    postCompleter ((PostFile u d n),_) "url" = MuVariable u
+    postCompleter ((PostFile u d n),_) "date" = MuVariable (createDateDisplay d)
+    postCompleter ((PostFile u d n),_) "name" = MuVariable n
+    postCompleter (_,t) "text" = MuVariable t
+
+compileArchive ts cfg = do
+    rpaths <- getDirectoryContents (base cfg </> "posts")
+    let paths = (reverse . sort) rpaths
+    let archives = catMaybes $ map parseArchive paths
+    let groupedArchives = L.groupBy (\(y1,m1,_,_) (y2,m2,_,_) -> y1 == y2 && m1 == m2) archives
+    out <- (archiveTemplate ts) (sub groupedArchives)
+    return out
+  where
+    sub posts "months" = MuList $ map monthCompleter posts
+    sub posts o = MuNothing
+
+    monthCompleter ((y,m,_,_):_) "month" = MuVariable (createYearMonth y m)
+    monthCompleter titles "titles" = MuList $ map titleCompleter titles
+
+    titleCompleter (_,_,title,_) "title" = MuVariable title
+    titleCompleter (_,_,_,url) "url" = MuVariable url
+
+createYearMonth :: String -> String -> String
+createYearMonth y m = monthYear
+  where monthYear = formatTime defaultTimeLocale "%B '%y" $ makeDate y m "0"
+
+compileAbout ts cfg = (aboutTemplate ts) $ \_ -> MuNothing
 
 writePage cfg text name = LB.writeFile (base cfg </> name ++ ".html") text
 
@@ -177,11 +250,25 @@ writeHome cfg text = writePage cfg text "index"
 
 writePosts cfg pages = mapM_ (\(name,text) -> writePage cfg text name) pages
 
+writeArchive cfg text = writePage cfg text "archive"
+
+writeAbout cfg text = writePage cfg text "about"
+
+
+data Sample = Sample {hello :: String}
+              deriving (Show, Data, Typeable)
+
+config = Config "." (-1)
+
 main = do
-    args <- getArgs
-    let cfg = getConfig args
+    cfg <- cmdArgs config
+    let limit = (if preview cfg == (-1) then Nothing else Just $ preview cfg)
     ts <- readTemplatesOrError (base cfg)
-    home <- compileHome ts cfg
+    home <- compileHome ts cfg limit
     writeHome cfg home
     posts <- compilePages ts cfg
     writePosts cfg posts
+    archive <- compileArchive ts cfg
+    writeArchive cfg archive
+    about <- compileAbout ts cfg
+    writeAbout cfg about

@@ -16,7 +16,7 @@ function scan_code() {
         if (match) {
             var lang = match[0].substr(2);
             var pre = $(el).parent();
-            var url = "/static/js/sh/sh_" + lang + ".min.js";
+            var url = "./static/js/sh/sh_" + lang + ".min.js";
             pre.addClass("sh_" + lang);
             $(el).html(c.substr(c.indexOf("\n") + 1));
             js_files[url] = 1;

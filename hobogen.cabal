@@ -29,4 +29,6 @@ executable hobogen
                        unordered-containers >=0.2,
                        wai,
                        wai-extra,
-                       wai-middleware-static
+                       wai-middleware-static,
+                       safe,
+                       cmdargs
