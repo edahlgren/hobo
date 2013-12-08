@@ -15,6 +15,7 @@ import           Network.Wai.Middleware.Rewrite
 import           Network.Wai.Middleware.RequestLogger
 import           Data.Monoid (mconcat, mappend)
 import           Text.Markdown.Discount (markdown)
+import		 System.IO (hPutStrLn, stderr)
 import           System.FilePath ((</>))
 import           System.Directory (doesFileExist, getDirectoryContents)
 import           System.Environment (getArgs)
@@ -30,6 +31,7 @@ import qualified Data.List as L
 import           Safe (fromJustNote)
 import           System.Console.CmdArgs
 import           Data.Word (Word8)
+import		 Data.Cache.LRU.IO as LRU
 
 markdownBS a = LB.fromChunks [markdown a]
 
@@ -46,6 +48,7 @@ type Template = (MuContext IO -> IO LB.ByteString)
 
 data Config = Config {
       base :: String
+    , port :: Int
     , preview :: Int
     } deriving (Show, Data, Typeable)
 
@@ -153,7 +156,7 @@ parseTitleParts = do
 parseParts' = do
     (year, month, day, name) <- parseTitleParts
     let date = makeDate year month day
-    let url = concat ["./", year, "-", month, "-", day, "-", name, ".html"]
+    let url = concat ["./", year, "/", month, "/", day, "/", name, ".html"]
     return (year,month,date,name,url)
 
 parseFilename = do
@@ -163,6 +166,7 @@ parseFilename = do
 compilePages ts cfg = do
     rpaths <- getDirectoryContents (base cfg </> "posts")
     let valid = catMaybes $ map validatePath rpaths
+    mapM logger valid
     pages <- mapM (compilePage ts cfg) valid
     return $ catMaybes pages
   where
@@ -260,8 +264,7 @@ data Sample = Sample {hello :: String}
 
 config = Config "." (-1)
 
-main = do
-    cfg <- cmdArgs config
+compile cfg = do
     let limit = (if preview cfg == (-1) then Nothing else Just $ preview cfg)
     ts <- readTemplatesOrError (base cfg)
     home <- compileHome ts cfg limit
@@ -272,3 +275,79 @@ main = do
     writeArchive cfg archive
     about <- compileAbout ts cfg
     writeAbout cfg about
+
+logger str = hPutStrLn stderr str
+
+toLazyBS bstr = LB.fromChunks [bstr]
+
+getPage cfg cache = do
+    year <- param "year"
+    month <- param "month"
+    day <- param "day"
+    name <- param "name"
+    let fullpath = concat ["./", (base cfg), "/", year, "-", month, "-", day, "-", name]
+    liftIO $ logger ("fullpath=" ++ fullpath)
+    exists <- liftIO $ doesFileExist fullpath
+    case exists of
+        True -> do
+	    -- check the cache
+	    maybePage <- liftIO $ LRU.lookup fullpath cache
+	    case (maybePage) of
+	        Just page -> html . TLE.decodeUtf8 $ page
+		Nothing -> do
+		    page <- liftIO $ B.readFile $ fullpath
+		    let lazyPage = toLazyBS page
+		    liftIO $ LRU.insert fullpath lazyPage cache
+		    html . TLE.decodeUtf8 $ lazyPage
+	False -> raise "Page not found"
+
+loadBasicPage path cache = do
+    exists <- doesFileExist path
+    when (exists) $ do
+        page <- B.readFile path
+	let lazyPage = toLazyBS page
+	LRU.insert path lazyPage cache
+
+getBasicPage path cache = do
+    maybePage <- liftIO $ LRU.lookup path cache
+    case maybePage of
+        Just page -> html . TLE.decodeUtf8 $ page
+	Nothing -> raise "Page not found"
+
+serve cfg = do
+    -- pre cache the homepage
+    -- otherwise use a simple lru for the pages, size very small.
+    cache <- LRU.newAtomicLRU (Just 10)
+
+    let homepath = (base cfg) ++ "/index.html"
+    loadBasicPage homepath cache
+    
+    let aboutpath = (base cfg) ++ "/about.html"
+    loadBasicPage aboutpath cache
+
+    let archivepath = (base cfg) ++ "/archive.html"
+    loadBasicPage archivepath cache
+
+    scotty (port cfg) $ do
+        middleware logStdoutDev
+        middleware $ rewrite $ rewritePostStatic cfg	
+        middleware $ staticPolicy
+            (noDots >-> (hasPrefix "static/" <|> (hasPrefix "posts/" >-> contains "."))
+            >-> addBase (base cfg))	
+	get "/archive" $ do
+	    getBasicPage archivepath cache
+	get "/about" $ do
+	    getBasicPage aboutpath cache
+	get "/:year/:month/:day/:name" $ do
+            getPage cfg cache
+	get "/" $ do
+	    getBasicPage homepath cache
+
+getConfig (base:port:preview:[]) = Config base (read port) (read preview)
+getConfig _ = error "wrong number of arguments to hobogen: use hobogen BASE_DIR PORT PREVIEW_LINES"
+
+main = do
+    args <- getArgs
+    let cfg = getConfig args
+    compile cfg
+    serve cfg

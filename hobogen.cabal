@@ -31,4 +31,5 @@ executable hobogen
                        wai-extra,
                        wai-middleware-static,
                        safe,
-                       cmdargs
+                       cmdargs,
+                       lrucache
