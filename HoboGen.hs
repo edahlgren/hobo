@@ -285,7 +285,7 @@ getPage cfg cache = do
     month <- param "month"
     day <- param "day"
     name <- param "name"
-    let fullpath = concat ["./", (base cfg), "/", year, "-", month, "-", day, "-", name]
+    let fullpath = concat [(base cfg), "/", year, "-", month, "-", day, "-", name]
     liftIO $ logger ("fullpath=" ++ fullpath)
     exists <- liftIO $ doesFileExist fullpath
     case exists of
