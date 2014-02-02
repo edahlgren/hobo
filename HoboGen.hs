@@ -31,7 +31,6 @@ import qualified Data.List as L
 import           Safe (fromJustNote)
 import           System.Console.CmdArgs
 import           Data.Word (Word8)
-import		 Data.Cache.LRU.IO as LRU
 
 markdownBS a = LB.fromChunks [markdown a]
 
@@ -280,53 +279,30 @@ logger str = hPutStrLn stderr str
 
 toLazyBS bstr = LB.fromChunks [bstr]
 
-getPage cfg cache = do
+getPage :: Config -> ActionM ()
+getPage cfg = do
     year <- param "year"
     month <- param "month"
     day <- param "day"
     name <- param "name"
     let fullpath = concat [(base cfg), "/", year, "-", month, "-", day, "-", name]
     liftIO $ logger ("fullpath=" ++ fullpath)
-    exists <- liftIO $ doesFileExist fullpath
+    getBasicPage fullpath
+
+getBasicPage :: FilePath -> ActionM ()
+getBasicPage path = do
+    exists <- liftIO $ doesFileExist path
     case exists of
         True -> do
-	    -- check the cache
-	    maybePage <- liftIO $ LRU.lookup fullpath cache
-	    case (maybePage) of
-	        Just page -> html . TLE.decodeUtf8 $ page
-		Nothing -> do
-		    page <- liftIO $ B.readFile $ fullpath
-		    let lazyPage = toLazyBS page
-		    liftIO $ LRU.insert fullpath lazyPage cache
-		    html . TLE.decodeUtf8 $ lazyPage
+	    page <- liftIO $ B.readFile path
+	    let lazyPage = toLazyBS page
+	    html . TLE.decodeUtf8 $ lazyPage
 	False -> raise "Page not found"
 
-loadBasicPage path cache = do
-    exists <- doesFileExist path
-    when (exists) $ do
-        page <- B.readFile path
-	let lazyPage = toLazyBS page
-	LRU.insert path lazyPage cache
-
-getBasicPage path cache = do
-    maybePage <- liftIO $ LRU.lookup path cache
-    case maybePage of
-        Just page -> html . TLE.decodeUtf8 $ page
-	Nothing -> raise "Page not found"
-
 serve cfg = do
-    -- pre cache the homepage
-    -- otherwise use a simple lru for the pages, size very small.
-    cache <- LRU.newAtomicLRU (Just 10)
-
-    let homepath = (base cfg) ++ "/index.html"
-    loadBasicPage homepath cache
-    
+    let homepath = (base cfg) ++ "/index.html"    
     let aboutpath = (base cfg) ++ "/about.html"
-    loadBasicPage aboutpath cache
-
     let archivepath = (base cfg) ++ "/archive.html"
-    loadBasicPage archivepath cache
 
     scotty (port cfg) $ do
         middleware logStdoutDev
@@ -335,13 +311,13 @@ serve cfg = do
             (noDots >-> (hasPrefix "static/" <|> (hasPrefix "posts/" >-> contains "."))
             >-> addBase (base cfg))	
 	get "/archive" $ do
-	    getBasicPage archivepath cache
+	    getBasicPage archivepath
 	get "/about" $ do
-	    getBasicPage aboutpath cache
+	    getBasicPage aboutpath
 	get "/:year/:month/:day/:name" $ do
-            getPage cfg cache
+            getPage cfg
 	get "/" $ do
-	    getBasicPage homepath cache
+	    getBasicPage homepath
 
 getConfig (base:port:preview:[]) = Config base (read port) (read preview)
 getConfig _ = error "wrong number of arguments to hobogen: use hobogen BASE_DIR PORT PREVIEW_LINES"
